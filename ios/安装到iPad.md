@@ -467,6 +467,32 @@ connect to the remote AltServer"**"*，而且作者在真机上**故意关掉修
 - 装法二选一：**iLoader**（官方推荐）或 **AltServer 隐藏菜单 `Sideload .ipa`**（`Shift` + 点托盘图标）
 - 免费账号下 **3 个 App 上限是共享的**（SideStore 自己也占 1 个）→ 换 SideStore 就别同时留着 AltStore
 
+### ⚠️⚠️ SideStore 的「版本陷阱」有两个，不止 503 那一个（2026-09-26 设备端取证）
+
+装完 iLoader 后首次刷新若报 **`.rppairing UDID not found`**，**不是配对文件坏、也不是 VPN 问题**：
+
+- 设备端日志逐字为：`tcpProbe 10.7.0.1:49152 (protocol: .rppairing) -> **reachable**`
+  → `tunnel_create_rppairing failed with **code: 16**, message: InternalError("**TLS tunnel: Operation Timeout**")`
+  ⇒ **TCP 通、TLS 握手超时** ⇒ VPN / 两个 IP / 路由 / 防火墙 / 被墙 / anisette 服务器**全部无关**。
+- 两层原因叠在一起：
+  1. iLoader 在 **iOS ≥ 17.4** 写的是**「二合一」plist**（lockdown 键 + rppairing 键同在一个文件里，源码
+     `pairing.rs`：`plist!(dict { :< lockdown_plist, :< rppairing_plist })`），而**旧版解析器先查 rppairing 键**
+     ⇒ 该文件**必然被判成 `.rppairing`**；
+  2. **`0.7.0-alpha`（09-11 构建）的 RemotePairing TLS 隧道本身有 bug** —— 上游 **issue #1592**
+     （症状/错误码/安装方式 iLoader→Import IPA/VPN LocalDevVPN/构建日期全部一致）被开发者以
+     **“sidestore has fix”** 关闭，修复落在 **`a5d7f3c updated submodules to latest`（2026-09-18）**。
+- ✅ **解法**：把 SideStore 换成**含修复的构建**（`nightly` tag 指向 `develop` HEAD，例如
+  `0.7.0-20260920.1479+0dd743f7`）——它的构建时间**晚于修复提交**。装完后新版会自动调
+  `MaintenanceManager.migratePairingFiles()` 把那份二合一文件**拆成 `PairingFile_Lockdown.plist` +
+  `PairingFile_RemoteRP.plist`**，并删除旧文件。
+- ⚠️ **版本判据「按天算」，别看标签**：这类 bug 修得快，**构建时间早于上游修复提交 = 带病版本**。
+  本例 `0.7.0-alpha` 是「官方 Stable 但已知有 bug」，`nightly` 反而才是修好的那个。
+- 🔧 **取证手法（可复用）**：SideStore 的调试日志走 `print()`，**不进系统 syslog**，但会写进 App 内文件
+  `Documents/ConsoleLogs/console_*.log` ⇒ 电脑上直接读：
+  `MSYS_NO_PATHCONV=1 python -m pymobiledevice3 apps afc --documents com.SideStore.SideStore.<TEAMID>`
+  然后 `cat ConsoleLogs/<文件>` 或 `cat ALTPairingFile.mobiledevicepairing`
+  （⚠️ `apps pull` 与 shell 的 `get` 在该容器报 `AFC_E_OBJECT_NOT_FOUND` status 8，**`cat` 可用**）。
+
 **一句话决策**
 - **电脑就在旁边** → **①**，零成本，别折腾
 - **必须在没有电脑的地方续签** → **② SideStore**（免费）或 **④ TestFlight**（花钱，最省心）
