@@ -1,0 +1,134 @@
+name: 构建 iOS 未签名 IPA
+
+# 为什么要有这个工作流：
+#   编译 iOS App **只能用 Xcode，而 Xcode 只能跑在 macOS 上**（沙箱、私有 SDK、clang 全绑死）。
+#   用户机器是 Windows → 借 GitHub 的 macOS runner 出一份**未签名**的 .ipa，
+#   再拿回 Windows 用侧载工具（AltStore / Sideloadly）用**免费 Apple ID** 签名装机。
+#   完整链路与注意点见 ios/README.md。
+#
+# ⚠️ 计费：macOS runner 按 **10× 倍率**计。
+#   私有仓库免费额度 2000 分钟/月 ≈ 200 分钟 macOS 时间；本工作流一次约 3–5 分钟。
+#   **公开仓库的标准 runner 不计费** —— 这也是这个仓库公开的原因之一。
+
+# 唯一的用途：编译失败时把日志提交回仓库（见下面那一步）。
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    # ⚠️ 用 paths-ignore 而不是 paths，是为了**顺手把回写日志这件事排除掉**：
+    #    本工作流在失败时会把 ios/build.log 提交并 push 回仓库，
+    #    若过滤规则写成 paths: ["ios/**"]，那个 log 匹配得上 → **触发自己 → 死循环**。
+    paths-ignore:
+      - "ios/build.log"
+      - "README.md"
+      - "LICENSE"
+
+jobs:
+  build-ios:
+    runs-on: macos-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 打印工具链版本（出问题时第一眼看这里）
+        run: |
+          xcodebuild -version
+          sw_vers
+          echo "--- runner 上可用的 SDK ---"
+          xcodebuild -showsdks | grep -i iphoneos || true
+
+      - name: 安装 XcodeGen
+        run: brew install xcodegen
+
+      - name: 生成 Xcode 工程
+        working-directory: ios
+        run: xcodegen generate
+
+      # 不签名编译：签名这一步留给用户机器上的侧载工具。
+      # 这里显式关掉三道签名开关，少一道都会在 CI 上因为没有证书而失败。
+      #
+      # ⚠️ continue-on-error + tee：编译失败也要**先把日志落盘再失败**。
+      #   否则远端（没有 macOS 的那一端）只能看到一句
+      #   "Process completed with exit code 65" —— 等于什么也没说。
+      - name: 编译（不签名）
+        id: build
+        continue-on-error: true
+        working-directory: ios
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project ConstructExam.xcodeproj \
+            -scheme ConstructExam \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee build.log
+
+      # ⭐ 失败时把日志**提交回仓库**。
+      #   为什么需要：能看到 Actions 日志页的人，未必是能改代码的人；
+      #   而**仓库里的文件，任何有读权限的人（或程序）都能读**。
+      #   这一步把「编译错误」从 Actions 的日志页搬进仓库，
+      #   于是修复循环可以在没有 UI、没有 macOS 的情况下完成。
+      - name: 失败时把编译日志提交回仓库
+        if: steps.build.outcome == 'failure'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f ios/build.log
+          git commit -m "ci: 编译失败日志（run #${{ github.run_number }}）" || true
+          git push || true
+
+      # ipa 的本质就是「一个名为 Payload 的目录，里面放着 .app，再整个 zip 起来」。
+      # 判定标准只有一条：Payload/ 下必须有且只有一个 .app。
+      - name: 打包成未签名 IPA
+        if: steps.build.outcome == 'success'
+        working-directory: ios
+        run: |
+          set -euo pipefail
+          APP="build/Build/Products/Release-iphoneos/ConstructExam.app"
+          # 产物不存在就直接失败 —— 绝不产出一个「看着成功、其实装不上」的空 IPA
+          test -d "$APP"
+          rm -rf Payload ConstructExam-unsigned.ipa
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry ConstructExam-unsigned.ipa Payload
+          echo "--- IPA 内容 ---"
+          unzip -l ConstructExam-unsigned.ipa | head -20
+          ls -lh ConstructExam-unsigned.ipa
+
+      # 编译通过后把上一次留下的失败日志删掉 ——
+      # 否则仓库里躺着一份过期的编译错误，后来人会以为现在还坏着。
+      # 判据：**仓库里任何一份「状态文件」都必须有被清除的路径**，否则它是永久噪音。
+      - name: 编译通过 → 清掉历史失败日志
+        if: steps.build.outcome == 'success'
+        run: |
+          if git ls-files --error-unmatch ios/build.log >/dev/null 2>&1; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git rm -f ios/build.log
+            git commit -m "ci: 编译已通过，清掉失败日志（run #${{ github.run_number }}）" || true
+            git push || true
+          fi
+
+      # if-no-files-found: error —— 宁可在 CI 上红，也不要让用户拿到空包
+      - name: 上传产物
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ConstructExam-unsigned-ipa
+          path: ios/ConstructExam-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: 编译失败 → 让 job 失败
+        if: steps.build.outcome == 'failure'
+        run: |
+          echo "❌ 编译失败。完整日志已提交到 ios/build.log —— 直接读那个文件，不要只看本页摘要。"
+          exit 1

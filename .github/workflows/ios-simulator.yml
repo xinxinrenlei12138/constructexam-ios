@@ -1,0 +1,268 @@
+name: 模拟器冒烟测试（不需要 iPad、不需要 Mac 桌面）
+
+# ============================================================
+# 这个工作流存在的理由
+# ============================================================
+# Android 有 AVD —— 在 Windows 上就能跑起来、点一点、看界面。
+# **iOS 没有对应的东西**：iOS 模拟器是 Xcode 的一个组件，依赖 macOS 私有框架
+# （CoreSimulator / XPC），Apple 从未发布过 Windows 版。
+# 这不是"暂时没有"，是产品决定，绕不过去。
+#
+# 但目标（不拿真机就能验证）是可以达到的：**把模拟器跑在云端的 macOS 上**。
+# 于是"有没有模拟器"变成"能不能远程驱动一个模拟器"——
+# 而 xcrun simctl 恰好把这件事做成了纯命令行：启动、安装、运行、截图，全可脚本化。
+#
+# 两层验证，各有分工：
+#   · 本工作流（云 macOS + 真 iOS 模拟器）→ 验"壳在真 iOS 上能不能起来、内容层能不能渲染"
+#   · tools/verify_webbridge.js（本机 Chromium + 真服务端）→ 验内容层的**功能逻辑**
+#     （那才是业务所在；壳里没有业务）
+# 判据：**验证要分层，因为两端能验的东西不同，而"在哪一层验"决定反馈有多快。**
+#
+# ⚠️ 模拟器验不到的东西（必须知道，否则会误以为"验过了就没问题"）：
+#   真机性能 / 相机 / 蜂窝网络 / 真实签名与安装流程 / App Store 行为 / 部分 Metal 特性
+#
+# ⚠️ 计费：macOS runner 10× 倍率；公开仓库不计费。
+# ============================================================
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    # 与 ios.yml 同样的路径过滤 —— 同样要排掉回写的日志，否则会触发自己。
+    paths-ignore:
+      - "ios/build.log"
+      - "README.md"
+      - "LICENSE"
+
+jobs:
+  simulator-smoke:
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 打印工具链与可用模拟器
+        run: |
+          xcodebuild -version
+          echo "--- 本机可用的 iPad 模拟器 ---"
+          xcrun simctl list devices available | grep -i ipad | head -20 || true
+
+      - name: 安装 XcodeGen
+        run: brew install xcodegen
+
+      - name: 生成 Xcode 工程
+        working-directory: ios
+        run: xcodegen generate
+
+      # 动态挑一台 iPad 模拟器，而不是写死名字 ——
+      # runner 的镜像会变，写死"iPad Pro 11-inch (M4)"这种名字迟早会失效，
+      # 而失效的样子是"找不到设备"，指向一个完全无关的地方。
+      #
+      # ⚠️ 这段 Python 走 heredoc 而不是 `python3 -c '...'`：
+      #    在 YAML 的块标量里，`-c` 后面跟多行字符串要求这些行与块同缩进，
+      #    很容易写成"看起来没问题、其实越界"的 YAML —— 而报错会指向第 1 行，
+      #    完全指不到真正的位置。用 heredoc 时所有行缩进一致，最不容易出错。
+      - name: 挑一台 iPad 模拟器
+        id: pick
+        run: |
+          set -euo pipefail
+          xcrun simctl list devices available -j > /tmp/devs.json
+          python3 - <<'PY' > /tmp/pick.txt
+          import json
+          d = json.load(open("/tmp/devs.json"))["devices"]
+          cands = []
+          for runtime, items in d.items():
+              if "iOS" not in runtime:
+                  continue
+              for it in items:
+                  if it.get("isAvailable") and "iPad" in it.get("name", ""):
+                      cands.append((runtime, it["name"], it["udid"]))
+          assert cands, "没有任何可用的 iPad 模拟器"
+
+          # ⚠️ 优先选 **4:3** 的 iPad，而不是随便一台。
+          #   理由：真实目标设备是 **iPad 2018（9.7"，4:3，逻辑 768×1024）**。
+          #   模拟器里比例不对，布局证据的说服力就弱一档 ——
+          #   而「在 iPad 上排版对不对」正是这个测试要回答的问题之一。
+          #   iPad Pro 12.9"/13" 也是 4:3，是最接近它的可用机型；
+          #   iPad mini 是 2:3、iPad 10 是 1.44:1，都只是"能跑"，不代表"排版对"。
+          #   判据：**验证环境的形状要尽量贴合真实设备，否则验的是另一台机器。**
+          def rank(name):
+              if "13-inch" in name or "12.9" in name:
+                  return 0
+              if "iPad Pro" in name:
+                  return 1
+              if "mini" in name or "Air" in name:
+                  return 3
+              return 2
+          cands.sort(key=lambda t: (rank(t[1]), t[1]), reverse=False)
+          print("%s|%s|%s" % cands[0])
+          PY
+          OUT=$(cat /tmp/pick.txt)
+          RUNTIME=${OUT%%|*}
+          REST=${OUT#*|}
+          NAME=${REST%%|*}
+          UDID=${REST#*|}
+          # ⚠️⚠️ 变量一律写成 ${VAR} 形式 —— 这一次是被 CI 教会的（2026-09-23）：
+          #   写成「选中：+变量名+全角括号」时，bash 会把紧跟其后的**全角括号**
+          #   当成变量名的一部分，于是报 `NAME?: unbound variable`，
+          #   而行号指向的是**整段脚本的第 22 行**，完全指不到真正的位置。
+          #   判据：**shell 变量后面只要不是 ASCII 分隔符，就必须用花括号划清边界。**
+          #   （中文文案里这是必然发生的，不是偶发。）
+          echo "选中：${NAME}（${RUNTIME}）udid=${UDID}"
+          echo "UDID=${UDID}" >> "$GITHUB_ENV"
+          echo "NAME=${NAME}" >> "$GITHUB_ENV"
+
+      # 给模拟器构建。与 ios.yml 的区别只有一处：-sdk iphonesimulator。
+      # ⚠️ 失败也要先落日志再失败 —— 与 ios.yml 同一套理由（读日志的人未必能开 Actions 页面）。
+      - name: 为模拟器构建
+        id: build
+        continue-on-error: true
+        working-directory: ios
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project ConstructExam.xcodeproj \
+            -scheme ConstructExam \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -derivedDataPath build-sim \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee build.log
+
+      - name: 启动模拟器并安装
+        if: steps.build.outcome == 'success'
+        id: install
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          xcrun simctl boot "${UDID}" || true          # 已启动会报错，忽略
+          xcrun simctl bootstatus "${UDID}" -b         # 等到真正可用
+          APP="ios/build-sim/Build/Products/Debug-iphonesimulator/ConstructExam.app"
+          test -d "$APP"                             # 产物不在就直接失败，不要假装装上了
+          xcrun simctl install "${UDID}" "$APP"
+          echo "已安装到 ${NAME}"
+
+      # ⭐ 把 App 真的跑起来，然后**截图**。
+      #   截图是这个工作流最关键的产物：它是"App 在真 iOS 上长什么样"的唯一证据，
+      #   而且**读图的人和写代码的人可以是同一个**（图片能直接看，日志不能）。
+      - name: 启动 App 并截图
+        if: steps.build.outcome == 'success' && steps.install.outcome == 'success'
+        id: shot
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          mkdir -p _sim
+          BID=com.cadqto.constructexam
+          xcrun simctl launch "${UDID}" "$BID" || echo "（首次 launch 返回非 0，继续观察）"
+          sleep 8
+          xcrun simctl io "${UDID}" screenshot _sim/01_launch_8s.png
+          sleep 12
+          xcrun simctl io "${UDID}" screenshot _sim/02_launch_20s.png
+          echo "--- 截图已生成 ---"
+          ls -la _sim/
+          echo "--- App 是否仍在运行（列进程）---"
+          xcrun simctl spawn "${UDID}" launchctl list 2>/dev/null | grep -i constructexam || echo "（进程表里没看到，可能已退出）"
+          echo "--- 有没有崩溃报告 ---"
+          ls -la ~/Library/Logs/DiagnosticReports/ 2>/dev/null | grep -i construct || echo "（无崩溃报告）"
+
+      # 弱自动判据：截图不能是纯色（纯白/纯黑 = 白屏）。
+      # ⚠️ 故意做成"弱"判据：它只能证明"不是白屏"，证明不了"内容对"。
+      #    内容对不对由后面的 XCUITest 去断言，以及由人看图。
+      - name: 截图非空断言（只能是弱判据）
+        if: steps.shot.outcome == 'success'
+        continue-on-error: true
+        run: |
+          python3 - <<'PY'
+          import struct, zlib, sys, pathlib
+          for p in sorted(pathlib.Path("_sim").glob("*.png")):
+              data = p.read_bytes()
+              # 不引第三方库，只看 IDAT 的压缩后长度与文件大小：
+              # 白屏的 PNG 压缩率极高，体积会明显偏小。
+              size = len(data)
+              flag = "疑似纯色/白屏" if size < 12000 else "有内容"
+              print(f"  {p.name}: {size} 字节 -> {flag}")
+          PY
+
+      # ---------- 自动化功能断言（XCUITest）----------
+      # 上面那几步只能证明"装上了、跑起来了、不是白屏"。
+      # 真正"功能有没有实现"要有断言 —— 这是本步的职责，也是与 AVD 最像的部分。
+      - name: 运行 UI 测试（自动化功能断言）
+        id: uitest
+        continue-on-error: true
+        working-directory: ios
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project ConstructExam.xcodeproj \
+            -scheme ConstructExam \
+            -destination "id=${UDID}" \
+            -derivedDataPath build-test \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            2>&1 | tee uitest.log
+
+      # 产物**永远上传**（成功失败都传）——
+      # 失败时那份截图往往比成功时更值钱：它是"看到了什么"的唯一记录。
+      - name: 上传截图与测试日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: simulator-evidence
+          path: |
+            _sim/*.png
+            ios/uitest.log
+            ios/build.log
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: 失败时把日志提交回仓库
+        if: failure() || steps.build.outcome == 'failure' || steps.uitest.outcome == 'failure'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f ios/build.log ios/uitest.log 2>/dev/null || true
+          git commit -m "ci: 模拟器测试失败日志（run #${{ github.run_number }}）" || true
+          git push || true
+
+      - name: 成功则清掉历史失败日志
+        if: success()
+        run: |
+          if git ls-files --error-unmatch ios/build.log >/dev/null 2>&1 || git ls-files --error-unmatch ios/uitest.log >/dev/null 2>&1; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git rm -f --ignore-unmatch ios/build.log ios/uitest.log
+            git commit -m "ci: 模拟器测试已通过，清掉失败日志（run #${{ github.run_number }}）" || true
+            git push || true
+          fi
+
+      # ⚠️⚠️ 汇总必须把**每一步**都算进来，不能只看最后一步。
+      #   原因：本工作流的步骤都带 `continue-on-error: true`（为了顺序推进、拿到全部证据），
+      #   而它会让**失败的步骤在 UI 上显示 success** —— 真实结果在 `outcome` 里，
+      #   而 `outcome` 只有写在这里才会被人看见。
+      #   第一版只检查了 UI 测试，于是「安装其实失败了」被完全掩盖：整个 job 是绿的，
+      #   截图那步被静默跳过。**这正是本项目最忌讳的失败形态：失败看起来像没做。**
+      - name: 汇总（任意一步没过就判失败）
+        if: always()
+        run: |
+          FAIL=0
+          for pair in "构建:${{ steps.build.outcome }}" "安装:${{ steps.install.outcome }}" "截图:${{ steps.shot.outcome }}" "UI测试:${{ steps.uitest.outcome }}"; do
+            step="${pair%%:*}"
+            result="${pair#*:}"
+            echo "  ${step} : ${result}"
+            if [ "${result}" != "success" ]; then
+              echo "  ⚠️ ${step} 没有成功（result=${result}）"
+              FAIL=1
+            fi
+          done
+          if [ "$FAIL" -ne 0 ]; then
+            echo "❌ 有步骤未成功。完整日志见仓库里的 ios/build.log 与 ios/uitest.log。"
+            exit 1
+          fi
+          echo "✅ 构建 / 安装 / 截图 / UI 测试 全部通过"

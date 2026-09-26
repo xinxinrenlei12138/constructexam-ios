@@ -1,0 +1,131 @@
+# ============================================================
+# iOS 壳的工程描述（给 XcodeGen 用）
+# ============================================================
+# 为什么用 XcodeGen 而不是把 .xcodeproj 入库：
+#   .pbxproj 是**生成物**，但它长得像源文件 —— 手工改一处 UUID 就能让
+#   工程在 Xcode 里"看起来正常、其实坏掉"。把它交给生成器，源就是这份 YAML。
+#   顺带解决一个现实问题：**我没有 macOS**，无法在本地生成/验证 .pbxproj，
+#   所以更不能把它当成手工维护的东西。
+#
+# 用法：在 ios/ 目录里 `xcodegen generate`（CI 里已自动做，见 .github/workflows/ios.yml）
+# ============================================================
+
+name: ConstructExam
+
+options:
+  bundleIdPrefix: com.cadqto
+  createIntermediateGroups: true
+  # ⚠️ 15.0 是**零代码代价下的最低门槛**（不是随便定的）：
+  #   · `@main App`          → iOS 14+
+  #   · `Color(uiColor:)`    → iOS 15+
+  #   · async 版 WKWebView 代理方法 → iOS 15+
+  #   再往下（14.0）就得同时改这三处，所以停在 15.0。
+  #   门槛每降一档，能被装上的 iPad 就多一批 —— 而这一档是白拿的。
+  deploymentTarget:
+    iOS: "15.0"
+
+settings:
+  base:
+    # 固定成 Swift 5 语言模式。
+    # ⚠️ 这不是偷懒：Xcode 16 起 Swift 6 的严格并发检查会把
+    #    WKWebView / URLSession 的回调判成跨 actor 访问，
+    #    在没有 Mac 可以反复编译的情况下，固定语言模式是**降低首次编译失败率**的手段。
+    SWIFT_VERSION: "5.0"
+
+targets:
+  ConstructExam:
+    type: application
+    platform: iOS
+    sources:
+      - path: ShellApp/Sources
+      # 图标资源。iOS 的 App 图标走 asset catalog：
+      # 满幅方图（系统自己切圆角），与安卓自适应图标不同 —— 详见生成脚本里的说明。
+      - path: ShellApp/Resources
+
+    settings:
+      base:
+        PRODUCT_NAME: ConstructExam
+        PRODUCT_BUNDLE_IDENTIFIER: com.cadqto.constructexam
+        # 告诉 Xcode 从 Assets.xcassets 里取 AppIcon。
+        # 不写这一行，图标文件在包里但**不会被当成 App 图标** ——
+        # 装到 iPad 上看到的是一个灰白占位方块，而构建完全成功、没有任何警告。
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+
+        # iOS 壳的版本号。**MARKETING_VERSION 是 iOS 侧唯一的手写落点** ——
+        # 它由 Xcode 自动写进生成的 Info.plist 的 CFBundleShortVersionString，
+        # 而壳在运行时读回这一项（ShellWebView.swift 的 ShellConfig.appVersion）→
+        # 页面「更多 → 关于」显示的版本号不会再与 APK 分叉。
+        # ⚠️ 2026-09-26 前这里写着"三个地方要一起改"（本文件 + ShellWebView.swift +
+        #    app/build.gradle.kts）；其中 ShellWebView.swift 那份**已改成运行时读**、
+        #    不再是手写副本，所以现在**只剩两处**：本文件与 app/build.gradle.kts。
+        #    （发版时 build_dist.sh【1】会读 gradle 的那一处并回写本文件对应的值。）
+        MARKETING_VERSION: "1.12.1"
+        CURRENT_PROJECT_VERSION: "19"
+
+        # 1 = iPhone, 2 = iPad。两个都要 —— iPad 是这一版的主要目标设备。
+        TARGETED_DEVICE_FAMILY: "1,2"
+
+        # 不手写 Info.plist，交给 Xcode 从下面这些键生成（少一个文件、少一处漂移）。
+        GENERATE_INFOPLIST_FILE: YES
+        # ⚠️⚠️ 这里必须是 **ASCII**，不能写中文。
+        #   AltServer 会拿这个值去 Apple 注册 **App ID 的名字**，而 Apple 校验**拒绝非 ASCII**：
+        #     报错「The name for this app is invalid」
+        #     （错误类名 ALTAppleAPIErrorInvalidAppIDName）
+        #   → 主页上要显示的中文名，放在 ShellApp/Resources/zh-Hans.lproj/InfoPlist.strings 里。
+        #     签名工具读 Info.plist 的**原值**，iOS 显示时读**本地化后的值** —— 不是同一个值。
+        INFOPLIST_KEY_CFBundleDisplayName: ConstructExam
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
+        # 横竖屏都给：页面自己做了宽度适配（窄屏/平板竖屏/平板横屏三档）。
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+
+        # ⚠️ 全部关闭签名 —— 这是**有意为之**，不是忘了配。
+        #    CI 只产出"未签名的 .app → 未签名 .ipa"，
+        #    签名留到用户机器上由 AltStore / Sideloadly 用**免费 Apple ID** 完成。
+        #    在这里打开任何一道签名开关，CI 都会因为没有证书而失败。
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_IDENTITY: ""
+        CODE_SIGN_STYLE: Manual
+        DEVELOPMENT_TEAM: ""
+
+  # ---------- UI 测试目标（云端模拟器上跑，见 .github/workflows/ios-simulator.yml）----------
+  # 它的存在就是为了回答一句：「壳在真 iOS 上到底起没起来、内容层渲没渲染」。
+  #
+  # ⚠️ 独立成 target，而不是塞进主 target 的编译里 —— 这样**测试代码编译失败
+  #    不会影响主 App 的构建**（`xcodebuild build` 只编 ConstructExam 这个 scheme 的主 target），
+  #    于是"发版"和"验证"两条路互不阻塞。
+  ConstructExamUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: ShellApp/UITests
+    dependencies:
+      - target: ConstructExam
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cadqto.constructexam.uitests
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        # 模拟器上跑测试不需要签名；打开任何一道签名开关，CI 都会因为没有证书而失败。
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_IDENTITY: ""
+
+schemes:
+  ConstructExam:
+    build:
+      targets:
+        ConstructExam: all
+        # [test] 表示"只有在跑测试时才构建"，所以 `xcodebuild build` 不会碰它。
+        ConstructExamUITests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - ConstructExamUITests
+    archive:
+      config: Release
