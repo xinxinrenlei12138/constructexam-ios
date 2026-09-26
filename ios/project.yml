@@ -59,7 +59,7 @@ targets:
         #    app/build.gradle.kts）；其中 ShellWebView.swift 那份**已改成运行时读**、
         #    不再是手写副本，所以现在**只剩两处**：本文件与 app/build.gradle.kts。
         #    （发版时 build_dist.sh【1】会读 gradle 的那一处并回写本文件对应的值。）
-        MARKETING_VERSION: "1.12.1"
+        MARKETING_VERSION: "1.12.2"
         CURRENT_PROJECT_VERSION: "19"
 
         # 1 = iPhone, 2 = iPad。两个都要 —— iPad 是这一版的主要目标设备。
